@@ -1,0 +1,200 @@
+#Импортируем библиотеки
+from airflow import DAG
+from airflow.operators.python_operator import PythonOperator 
+from datetime import datetime,  timedelta
+from airflow.decorators import dag, task
+from io import StringIO 
+import requests 
+from airflow.operators.python import get_current_context 
+import pandas as pd
+import pandahouse as ph
+
+
+# Дефолтные параметры, прокидываются в таски
+default_args = {
+    'owner': 'an-makarova', # Владелец операции 
+    'depends_on_past': False, # Зависимость от прошлых запусков
+
+    'retries': 2, # Кол-во попыток выполнить DAG
+    'retry_delay': timedelta(minutes=5), # Промежуток между перезапусками
+    'start_date': datetime(2022, 11, 9)
+}
+
+connect_test = {
+        'host': ' ',
+        'password': ' ',
+        'user': ' ',
+        'database': 'test'
+        }
+
+# Интервал запуска DAG'а
+schedule_interval = '0 0 * * *' 
+
+ 
+# Основной DAG
+@dag(default_args=default_args, schedule_interval=schedule_interval, catchup=False)
+def dag_makarova_etl():
+
+    # Таск вытаскивает данные из feed_actions
+    @task()
+    def extract_actions():
+        # Создаем подключение к БД 
+        connection = {'host': ' ',
+                              'database':' ',
+                              'user':' ', 
+                              'password':' '
+                             }
+
+        # Вытаскиваем данные 
+        q1 = """
+        SELECT 
+            user_id,
+            MAX(age) as age , 
+            MAX(os) as os,
+            MAX(gender) as gender,
+            sum(action = 'like') as likes,
+            sum(action = 'view') as views,
+            toString(toDate(time)) as event_date
+        FROM feed_actions 
+        WHERE toDate(time) = today() - 1
+        GROUP BY  user_id, event_date
+        
+        """
+        df = ph.read_clickhouse(q1, connection=connection)
+        return df
+
+    
+    # Таск вытаскивает данные из message_actions
+    @task()     
+    def extract_message():
+        
+        connection = {'host': ' ',
+                              'database':' ',
+                              'user':' ', 
+                              'password':' '
+                             }
+
+        
+        q2 = """
+                SELECT user_id,
+                        age, 
+                        os,  gender,
+                       messages_sent,
+                       users_sent,
+                       messages_received,
+                       users_received,
+                       event_date
+                FROM
+                  (SELECT 
+                            user_id,
+                            MAX(age) as age , 
+                            MAX(os) as os,
+                            MAX(gender) as gender,
+                            count(reciever_id) as messages_sent,
+                            count(distinct reciever_id) as users_sent,
+                            toString(toDate(time)) as event_date
+                        FROM message_actions 
+                        GROUP BY  user_id, event_date      
+                      HAVING toDate(time) = today() - 1) t1
+                   JOIN
+                     (SELECT 
+                            reciever_id,
+                            count(user_id) as messages_received,
+                            count(distinct user_id) as users_received,
+                            toString(toDate(time)) as event_date
+                        FROM message_actions 
+                        GROUP BY  reciever_id, event_date      
+                      HAVING toDate(time) = today() - 1) t2
+                   ON t1.user_id =t2.reciever_id
+                   
+        """
+        df = ph.read_clickhouse(q2, connection=connection)
+        return df
+
+   
+    # Такс джойнит исходные таблицы
+    @task()     
+    def transform(df_cube_feed,df_cube_mess):
+        df_total1 = df_cube_feed.merge(df_cube_mess, how='outer', on=['user_id', 'event_date', 'age', 'os',  'gender'])  
+        return df_total1
+    
+    # Таск трансформации в разрезе ОС
+    @task()     
+    def transform_os(df):
+        df_os = df.groupby(['event_date','os'])\
+        ['views','likes','messages_received','messages_sent','users_received','users_sent'].sum().reset_index()
+        df_os['dimension'] = 'os'
+        df_os.rename(columns = {'os' : 'dimension_value'}, inplace = True)
+        return df_os
+    
+    # Таск трансформации в разрезе пола
+    @task() 
+    def transform_gender(df):
+        df_g = df.groupby(['event_date','gender'])\
+        ['views','likes','messages_received','messages_sent','users_received','users_sent'].sum().reset_index()
+        df_g['dimension'] = 'gender'
+        df_g.rename(columns = {'gender' : 'dimension_value'}, inplace = True)
+        return df_g
+    
+    # Таск трансформации в разрезе возраста
+    @task() 
+    def transform_age(df):
+        df_age = df.groupby(['event_date','age'])\
+        ['views','likes','messages_received','messages_sent','users_received','users_sent'].sum().reset_index()
+        df_age['dimension'] = 'age'
+        df_age.rename(columns = {'age' : 'dimension_value'}, inplace = True)
+        return df_age
+    
+    # Таск объединяет срезы
+    @task() 
+    def concat_all(df1, df2, df3):
+        df_total = pd.concat([df1, df2, df3])
+        df_total = df_total.astype({
+                                    #'dimension' : 'string',
+                                    #'dimension_value' : 'string',
+                                    #'event_date' : 'datetime64',
+                                    'views': 'int32',
+                                    'likes': 'int32',
+                                    'messages_sent': 'int32',
+                                    'users_sent': 'int32',
+                                    'messages_received' : 'int32',
+                                    'users_received' : 'int32'
+                                   })
+        return df_total
+
+
+    # Таск загружает данные в БД test
+    @task()     
+    def load(result):
+        create_table = """
+                CREATE TABLE IF NOT EXISTS test.makarova_etl(
+                dimension String,
+                dimension_value String,
+                event_date String,
+                views Int32,
+                likes Int32,
+                messages_sent Int32,
+                users_sent Int32,
+                messages_received Int32,
+                users_received Int32)
+                ENGINE = MergeTree()
+                ORDER BY event_date
+                """
+        ph.execute(query=create_table, connection=connect_test)
+        ph.to_clickhouse(df = result, table = 'makarova_etl', connection=connect_test, index=False)
+        
+        
+    # Выполняю таски
+    df_cube_feed = extract_actions()
+    df_cube_mess = extract_message()
+    df_all = transform(df_cube_feed,df_cube_mess)
+    df_os = transform_os(df_all)
+    df_g = transform_gender(df_all)
+    df_age = transform_age(df_all)
+    result =  concat_all(df_os, df_g, df_age)  
+    
+    load(result)
+
+    
+    
+dag_makarova_etl = dag_makarova_etl()
